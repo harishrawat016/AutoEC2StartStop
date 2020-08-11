@@ -1,0 +1,21 @@
+{
+  "source": [
+    "aws.tag"
+  ],
+  "detail-type": [
+    "Tag Change on Resource"
+  ],
+  "detail": {
+    "service": [
+      "ec2"
+    ],
+    "resource-type": [
+      "instance"
+    ]
+  }
+}
+
+
+Allow Lambda Function to get inovoked from eventBridge Service
+
+aws lambda add-permission --function-name AutoScheduled-EC2StartStop --action lambda:InvokeFunction --statement-id event --principal events.amazonaws.com --output text --profile sandbox --region us-west-2
