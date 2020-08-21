@@ -1,0 +1,263 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Auto Start Stop of EC2 Instances on basis of tags
+Resources:
+  rAWSLambdaFunctionEventRuleCreate:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: rLambdaManagedPolicy
+    Properties:
+      FunctionName: CreateEventBridgeRulesOnEC2TagUpdates
+      Description: Lambda function to create Event Bridge Rules, these rules will trigger the another lambda function
+      Handler: index.lambda_handler
+      Runtime: python3.7
+      MemorySize: 512
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import re
+          import time
+          def lambda_handler(event, context):
+            allRegions=['us-east-2','us-east-1','us-west-2','ap-northeast-1','us-west-1']
+            ebRulesAll=[]
+            allTagsEc2=[]
+            tagStr=""
+            cfRegionName = os.environ['AWS_REGION']
+            sts_conn_cli = boto3.client(service_name='sts')
+            acc_number = sts_conn_cli.get_caller_identity()["Account"]
+            
+            # Function To Delete Stale EventBridge Rules Entry
+            def DeleteStateEBRules(ebClient,ebRulesAll,allTagsEc2):
+              ebClient = ebClient
+              ebRulesAll = ebRulesAll
+              allTagsEc2 = allTagsEc2
+              for eachRule in ebRulesAll:
+                if(eachRule not in allTagsEc2):
+                  ebClient.remove_targets(Rule=eachRule,Ids=['123456'])
+                  ebClient.delete_rule(Name=eachRule,Force=True)
+
+            # Function to Create New Event Bride Rules as per Tag updates
+            def createEB_Rule(tag,action):
+                hrs = tag['Value'].split(":")[0]
+                mins = tag['Value'].split(":")[1]
+                cronjob = "cron(" + mins + "\t"+ hrs + "\t?\t*\t*\t*)"
+                arnLambda = "arn:aws:lambda:" + cfRegionName + ":" + acc_number + ":function:AutoScheduled-EC2StartStop"
+                if(action == 'ec2stop'):
+                  ruleName = "EC2_Stop_at_" + hrs +"_"+ mins
+                  inputEvents = '{"hrs": "'+ hrs + '","mins":"' + mins + '","action":"' + action +'"}'
+                elif(action == 'ec2start'):
+                  ruleName = "EC2_Start_at_" + hrs +"_"+ mins
+                  inputEvents = '{"hrs": "'+ hrs + '","mins":"' + mins + '","action":"' + action +'"}'
+                if (ruleName not in ebRulesAll):
+                  ebClient.put_rule(Name=ruleName,ScheduleExpression=cronjob)
+                  ebClient.put_targets(Rule=ruleName,Targets=[{'Id':'123456','Arn':arnLambda,'Input': inputEvents}])
+            
+            for region in allRegions:
+              ebClient = boto3.client(service_name='events', region_name=cfRegionName)
+              ec2Client = boto3.client(service_name='ec2', region_name=region)
+              ec2rsc = boto3.resource(service_name='ec2', region_name=region)
+
+              ebPaginator = ebClient.get_paginator('list_rules')
+              for eachPage in ebPaginator.paginate():
+                for eachRule in eachPage['Rules']:
+                  if (re.match("^EC2_",eachRule['Name'])):
+                    hrsTemp = eachRule['Name'].split("_")[-2]
+                    minsTemp = eachRule['Name'].split("_")[-1]
+                    cronjobTemp = "cron(" + minsTemp + "\t"+ hrsTemp + "\t?\t*\t*\t*)"
+                    ebRulesAll.append(eachRule['Name'])
+                    
+              for eachEC2 in ec2Client.describe_instances( Filters=[{'Name': 'tag-key','Values': ['ec2start','ec2stop']}])['Reservations']:
+                for eachInstance in eachEC2['Instances']:
+                  for tag in eachInstance['Tags']:
+                    if (tag['Key'] == "ec2stop"):
+                      createEB_Rule(tag,'ec2stop')
+                      tagStr="EC2_Stop_at_"+ tag['Value'].split(":")[0] + "_" + tag['Value'].split(":")[1]
+                      allTagsEc2.append(tagStr)
+                    elif (tag['Key'] == "ec2start"):
+                      createEB_Rule(tag,'ec2start')
+                      tagStr="EC2_Start_at_"+ tag['Value'].split(":")[0] + "_" + tag['Value'].split(":")[1]
+                      allTagsEc2.append(tagStr)
+            # Remove Duplicate Enteries from list
+            ebRulesAll = list(dict.fromkeys(ebRulesAll))
+            allTagsEc2 = list(dict.fromkeys(allTagsEc2))
+            
+            DeleteStateEBRules(ebClient,ebRulesAll,allTagsEc2)
+
+      Role: !GetAtt rLambdaServiceRole.Arn
+      Tags:
+        - Key: Name
+          Value: CreateEventBridgeRulesOnEC2TagUpdates
+
+  rAWSLambdaFunctionEC2StartStop:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: rLambdaManagedPolicy
+    Properties:
+      FunctionName: AutoScheduled-EC2StartStop
+      Description: Lambda function to Start Stop EC2
+      Handler: index.lambda_handler
+      Runtime: python3.7
+      MemorySize: 512
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import re
+          import time
+          import json
+          from pprint import pprint
+
+          def lambda_handler(event, context):
+              hrs = event['hrs']
+              mins = event['mins']
+              action = event['action']
+              allRegions=['us-east-2','us-east-1','us-west-2','ap-northeast-1','us-west-1']
+              #ec2Client = boto3.client(service_name='ec2', region_name='us-west-2')
+              if(action == "ec2start"):
+                tagName = "tag:ec2start"
+              elif(action == "ec2stop"):
+                tagName = "tag:ec2stop"
+              tagValue = hrs+":"+mins
+              tagFilter = {'Name': tagName, 'Values':[tagValue]}
+              for region in allRegions:
+                targetIDs=[]
+                ec2Client = boto3.client(service_name='ec2', region_name=region)
+                ec2Paginator = ec2Client.get_paginator('describe_instances')
+                ec2Instances = ec2Paginator.paginate(Filters=[tagFilter])
+                for eachInstance in ec2Instances:
+                  for eachReservation in eachInstance['Reservations']:
+                    for instance in eachReservation['Instances']:
+                      targetIDs.append(instance['InstanceId'])
+                if(action == "ec2start" and targetIDs != []):
+                  ec2Client.start_instances(InstanceIds=targetIDs)
+                elif(action == "ec2stop" and targetIDs != []):
+                  ec2Client.stop_instances(InstanceIds=targetIDs,Force=True)
+      Role: !GetAtt rLambdaServiceRole.Arn
+      Tags:
+        - Key: Name
+          Value: AutoScheduled-EC2StartStop
+
+  rLambdaServiceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+        Path: /
+        RoleName: Lambda-EC2AutoStartStop-Role
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            -
+              Effect: Allow
+              Principal:
+                Service:
+                  - "lambda.amazonaws.com"
+              Action:
+                - "sts:AssumeRole"
+        PermissionsBoundary: !Sub 'arn:aws:iam::${AWS::AccountId}:policy/LZ-IAM-Boundary'
+  rLambdaManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Policy to allow actions on EC2 and EventBridge Services
+      ManagedPolicyName: EC2AutoStartStop-Policy
+      Path: /
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - "iam:PassRole"
+          Resource: !GetAtt rLambdaServiceRole.Arn
+        - Effect: Allow
+          Action:
+          - "events:List*"
+          - "events:PutEvents"
+          - "events:DeleteRule"
+          - "events:PutTargets"
+          - "events:PutPartnerEvents"
+          - "events:EnableRule"
+          - "events:PutPermission"
+          - "events:DisableRule"
+          - "events:PutRule"
+          - "events:RemoveTargets"
+          Resource: "*"
+        - Effect: Allow
+          Action:
+          - "ec2:StartInstances"
+          - "ec2:StopInstances"
+          - "ec2:Describe*"
+          Resource: "*"
+        - Effect: Allow
+          Action:
+          - "lambda:List*"
+          - "lambda:InvokeFunction"
+          - "lambda:GetFunction"
+          Resource: "*"
+      Roles: 
+       - Ref : rLambdaServiceRole
+    DependsOn: rLambdaServiceRole
+  rRuleToTriggerLambda:
+    Type: AWS::Events::Rule
+    DependsOn: rAWSLambdaFunctionEventRuleCreate 
+    Properties:
+      Description: Rule to run lambda continously
+      Name: InvokeLambdaOnEC2TagUpdate
+      State: ENABLED
+      EventPattern: 
+        source: 
+          - "aws.tag"
+        detail-type: 
+          - "Tag Change on Resource"
+        detail: 
+          service: 
+            - "ec2"
+          resource-type:
+            - "instance"
+      Targets:
+      - Arn:
+          Fn::GetAtt:
+          - rAWSLambdaFunctionEventRuleCreate
+          - Arn
+        Id: TargetFn
+
+  rRuleToTriggerLambdaEvery6Hours:
+    Type: AWS::Events::Rule
+    DependsOn: rAWSLambdaFunctionEventRuleCreate 
+    Properties:
+      Description: Rule to run lambda every 6 hours
+      Name: InvokeLambdaToCheckNewTags
+      State: ENABLED
+      ScheduleExpression: rate(6 hours)
+      Targets:
+      - Arn:
+          Fn::GetAtt:
+          - rAWSLambdaFunctionEventRuleCreate
+          - Arn
+        Id: TargetFn
+
+  rRule1PermissionToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref rAWSLambdaFunctionEventRuleCreate
+      Action: lambda:InvokeFunction
+      Principal: "events.amazonaws.com"
+      
+  rRule2PermissionToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref rAWSLambdaFunctionEventRuleCreate
+      Action: lambda:InvokeFunction
+      Principal: "lambda.amazonaws.com"
+      
+  rRule1PermissionToInvokeLambdaEC2:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref rAWSLambdaFunctionEC2StartStop
+      Action: lambda:InvokeFunction
+      Principal: "events.amazonaws.com"
+      
+  rRule2PermissionToInvokeLambdaEC2:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref rAWSLambdaFunctionEC2StartStop
+      Action: lambda:InvokeFunction
+      Principal: "lambda.amazonaws.com"
+      
